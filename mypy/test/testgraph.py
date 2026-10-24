@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from collections.abc import Set as AbstractSet
 
 from mypy.build import BuildManager, BuildSourceSet, State, order_ascc, sorted_components
@@ -84,9 +86,13 @@ class GraphSuite(Suite):
         sccs = {frozenset(x) for x in strongly_connected_components(vertices, edges)}
         assert_equal(sccs, {frozenset({"A"}), frozenset({"B", "C"}), frozenset({"D"})})
 
-    def _make_manager(self) -> BuildManager:
+    def _make_manager(
+        self, parallel_worker: bool = False, cache_dir: str | None = None
+    ) -> BuildManager:
         options = Options()
         options.use_builtins_fixtures = True
+        if cache_dir is not None:
+            options.cache_dir = cache_dir
         errors = Errors(options)
         fscache = FileSystemCache()
         search_paths = SearchPaths((), (), (), ())
@@ -105,6 +111,7 @@ class GraphSuite(Suite):
             fscache=fscache,
             stdout=sys.stdout,
             stderr=sys.stderr,
+            parallel_worker=parallel_worker,
         )
         return manager
 
@@ -136,3 +143,33 @@ class GraphSuite(Suite):
         ascc = res[1]
         scc = order_ascc(graph, ascc)
         assert_equal(scc, ["d", "c", "b", "a"])
+
+    def test_reload_meta_missing_cache_is_noop(self) -> None:
+        # Regression test for #22241: a parallel worker must not assert when the
+        # cache meta is missing, e.g. because a cache write was dropped while the
+        # sqlite cache was locked by a concurrent mypy run. It should keep the
+        # interface hash it already has instead of crashing the worker.
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = self._make_manager(parallel_worker=True, cache_dir=tmp)
+            state = State.new_state("a", os.path.join(tmp, "a.py"), "pass", manager)
+            state.interface_hash = b"existing"
+            state.reload_meta()  # there is no cache meta for "a": must not raise
+            assert_equal(state.interface_hash, b"existing")
+
+    def test_load_tree_parses_when_cache_data_is_missing(self) -> None:
+        # Regression test for #22241: the same dropped write can leave the tree
+        # cache file missing in a parallel worker. Leaving state.tree as None
+        # crashes later in fix_cross_refs(), so load_tree() must treat the missing
+        # file as a cache miss and parse the source.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "a.py")
+            with open(path, "w") as f:
+                f.write("x: int = 1\n")
+            manager = self._make_manager(
+                parallel_worker=True, cache_dir=os.path.join(tmp, "cache")
+            )
+            state = State.new_state("a", path, None, manager)
+            state.load_tree()
+            assert state.tree is not None, "load_tree() must not leave the tree unset"
+            assert_equal(state.tree.fullname, "a")
+            assert_equal(len(state.tree.defs), 1)
